@@ -18,6 +18,8 @@ class CurrencyVolumeImbalanceStrategy(QCAlgorithm):
     VOLUME_LOOKBACK = 50         # bars for rolling volume average
     VOLUME_MULTIPLIER = 2.0      # volume must exceed avg by this factor
     BODY_RATIO_MIN = 0.6         # minimum body / range ratio
+    TREND_EMA_PERIOD = 50        # EMA period on higher timeframe
+    TREND_BAR_MINUTES = 15       # higher timeframe bar size
 
     def initialize(self):
         self.set_start_date(2023, 1, 1)
@@ -39,6 +41,11 @@ class CurrencyVolumeImbalanceStrategy(QCAlgorithm):
         self._zones = []
         self._bar_count = 0
 
+        # Higher-timeframe trend filter
+        self._trend_ema = ExponentialMovingAverage(self.TREND_EMA_PERIOD)
+        self._trend_consolidator = TradeBarConsolidator(timedelta(minutes=self.TREND_BAR_MINUTES))
+        self._trend_consolidator.data_consolidated += self._on_trend_bar
+
     # ── Data Handling ───────────────────────────────────────────────
 
     def on_data(self, data: Slice):
@@ -50,17 +57,26 @@ class CurrencyVolumeImbalanceStrategy(QCAlgorithm):
             self._current_contract = mapped
             self._volume_window.reset()
             self._prev_bar = None
+            # Recreate consolidator for new contract symbol (EMA persists across rolls)
+            self._trend_consolidator = TradeBarConsolidator(timedelta(minutes=self.TREND_BAR_MINUTES))
+            self._trend_consolidator.data_consolidated += self._on_trend_bar
 
         if not data.bars.contains_key(mapped):
             return
 
         bar = data.bars[mapped]
+        self._trend_consolidator.update(bar)
         self._detect_volume_imbalance(bar)
 
         if not self.portfolio.invested:
             self._check_entry(bar)
 
         self._prev_bar = bar
+
+    # ── Trend Filter ────────────────────────────────────────────────
+
+    def _on_trend_bar(self, sender, bar):
+        self._trend_ema.update(bar.end_time, bar.close)
 
     # ── Volume Imbalance Detection ─────────────────────────────────
 
@@ -138,6 +154,10 @@ class CurrencyVolumeImbalanceStrategy(QCAlgorithm):
     # ── Entry Logic ─────────────────────────────────────────────────
 
     def _check_entry(self, bar):
+        # Only enter when price is above the higher-timeframe EMA
+        if not self._trend_ema.is_ready or bar.close < self._trend_ema.current.value:
+            return
+
         for zone in self._zones:
             if not zone["active"]:
                 continue
